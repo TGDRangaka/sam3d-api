@@ -54,6 +54,7 @@ import uuid
 from typing import List, Dict, Optional
 from PIL import Image
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -112,6 +113,13 @@ app = FastAPI(
     title="SAM 2 Image Segmentation API",
     description="Segment objects in images using Segment Anything Model 2 (Hugging Face)",
     version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Create assets folder for downloadable files
