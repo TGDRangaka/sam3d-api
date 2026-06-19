@@ -590,39 +590,69 @@ _PROMPT_COLORS: Dict[str, tuple] = {
 _DEFAULT_COLOR = (255, 255, 60, 160)
 
 
-def _masks_to_colored_png_b64(masks, image_h: int, image_w: int, prompt: str) -> str:
-    """
-    Union boolean masks and return a pre-colored RGBA PNG (base64).
+def _mask_u8_to_full(mask, image_h: int, image_w: int) -> np.ndarray:
+    """Resize a boolean or uint8 mask to (image_h, image_w) uint8 0/255."""
+    m_u8 = (mask > 0).astype(np.uint8) * 255
+    if m_u8.shape != (image_h, image_w):
+        m_u8 = cv2.resize(m_u8, (image_w, image_h), interpolation=cv2.INTER_NEAREST)
+    return m_u8
 
-    Detected pixels → semi-transparent class color.
-    Background pixels → fully transparent.
-    Mobile overlays this directly; no tintColor needed.
-    """
-    # Build grayscale union first
-    union = np.zeros((image_h, image_w), dtype=np.uint8)
-    for m in masks:
-        if m.shape != (image_h, image_w):
-            m_resized = cv2.resize(
-                m.astype(np.uint8) * 255,
-                (image_w, image_h),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            union = np.maximum(union, m_resized)
-        else:
-            union = np.maximum(union, m.astype(np.uint8) * 255)
 
+def _mask_to_colored_png_b64(mask_u8: np.ndarray, prompt: str) -> str:
+    """
+    Convert a single uint8 mask (H, W, values 0/255) to a pre-colored RGBA PNG.
+    Detected pixels → semi-transparent class color. Background → fully transparent.
+    """
     r, g, b, a = _PROMPT_COLORS.get(prompt.lower(), _DEFAULT_COLOR)
-
-    # RGBA canvas: detected pixels get (r,g,b,a), rest stays (0,0,0,0)
+    image_h, image_w = mask_u8.shape
     rgba = np.zeros((image_h, image_w, 4), dtype=np.uint8)
-    detected = union > 127
-    rgba[detected] = [r, g, b, a]
-
-    overlay_pil = Image.fromarray(rgba, mode="RGBA")
+    rgba[mask_u8 > 127] = [r, g, b, a]
     buf = io.BytesIO()
-    overlay_pil.save(buf, format="PNG")
+    Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _mask_to_grayscale_png_b64(mask_u8: np.ndarray) -> str:
+    """Convert a uint8 mask (H, W, values 0/255) to a grayscale PNG base64 string."""
+    buf = io.BytesIO()
+    Image.fromarray(mask_u8, mode="L").save(buf, format="PNG")
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _mask_bbox(mask_u8: np.ndarray) -> List[int]:
+    """Return [x, y, w, h] bounding box of the non-zero region. [0,0,0,0] if empty."""
+    coords = cv2.findNonZero(mask_u8)
+    if coords is None:
+        return [0, 0, 0, 0]
+    x, y, w, h = cv2.boundingRect(coords)
+    return [int(x), int(y), int(w), int(h)]
+
+
+def _build_instance_list(masks: list, scores: list, image_h: int, image_w: int, prompt: str) -> list:
+    """
+    Given raw bool masks + scores from _sam3_infer_single, build the instance list
+    returned in the API response.
+
+    Each instance:
+      id        — zero-based index within this prompt
+      mask      — pre-colored RGBA PNG (overlay, base64)
+      raw_mask  — grayscale PNG (for 3D generation, base64)
+      score     — confidence float
+      bbox      — [x, y, w, h] in image pixels (for badge placement on mobile)
+    """
+    instances = []
+    for idx, (m, score) in enumerate(zip(masks, scores)):
+        m_u8 = _mask_u8_to_full(m, image_h, image_w)
+        instances.append({
+            "id": idx,
+            "mask": _mask_to_colored_png_b64(m_u8, prompt),
+            "raw_mask": _mask_to_grayscale_png_b64(m_u8),
+            "score": round(float(score), 4),
+            "bbox": _mask_bbox(m_u8),
+        })
+    return instances
 
 
 @app.post("/segment-sam3")
@@ -685,26 +715,22 @@ async def segment_sam3(request: SegmentSam3Request):
             result_masks = []
             for prompt in request.prompts:
                 masks, scores = _sam3_infer_single(image_pil, prompt)
-                best_score = max(scores) if scores else 0.0
-                mask_b64 = _masks_to_colored_png_b64(masks, image_h, image_w, prompt)
+                instances = _build_instance_list(masks, scores, image_h, image_w, prompt)
                 result_masks.append({
                     "prompt": prompt,
-                    "mask": mask_b64,
-                    "score": round(best_score, 4),
-                    "instance_count": len(masks),
+                    "instances": instances,
+                    "instance_count": len(instances),
                 })
 
         # ------------------------------------------------------------------
-        # sequential_tiles — tile grid, one prompt×tile at a time
+        # sequential_tiles — tile grid, one prompt×tile at a time.
+        # Instances from different tiles are kept separate so the mobile can
+        # display and select individual objects across the full image.
         # ------------------------------------------------------------------
         elif request.mode == "sequential_tiles":
             tiles = ImageTiler.create_tiles(image_pil, request.tile_grid)
-            # Accumulate full-image masks per prompt
-            prompt_full_masks: Dict[str, np.ndarray] = {
-                p: np.zeros((image_h, image_w), dtype=np.uint8) for p in request.prompts
-            }
-            prompt_best_score: Dict[str, float] = {p: 0.0 for p in request.prompts}
-            prompt_instance_count: Dict[str, int] = {p: 0 for p in request.prompts}
+            # Per-prompt list of (mask_u8_full_canvas, score) tuples
+            prompt_instances: Dict[str, list] = {p: [] for p in request.prompts}
 
             for tile_img, (x0, y0, x1, y1) in tiles:
                 tile_h = y1 - y0
@@ -713,32 +739,27 @@ async def segment_sam3(request: SegmentSam3Request):
                     masks, scores = _sam3_infer_single(tile_img, prompt)
                     if not masks:
                         continue
-                    best_score = max(scores)
-                    if best_score > prompt_best_score[prompt]:
-                        prompt_best_score[prompt] = best_score
-                    prompt_instance_count[prompt] += len(masks)
-                    for m in masks:
-                        # Resize tile mask to tile dimensions, then place into full canvas
-                        m_u8 = cv2.resize(
+                    for m, score in zip(masks, scores):
+                        # Place tile mask onto full-image canvas
+                        m_u8_tile = cv2.resize(
                             m.astype(np.uint8) * 255,
                             (tile_w, tile_h),
                             interpolation=cv2.INTER_NEAREST,
                         )
-                        prompt_full_masks[prompt][y0:y1, x0:x1] = np.maximum(
-                            prompt_full_masks[prompt][y0:y1, x0:x1], m_u8
-                        )
+                        canvas = np.zeros((image_h, image_w), dtype=np.uint8)
+                        canvas[y0:y1, x0:x1] = m_u8_tile
+                        prompt_instances[prompt].append((canvas, float(score)))
 
             result_masks = []
             for prompt in request.prompts:
-                full_mask = prompt_full_masks[prompt]
-                mask_b64 = _masks_to_colored_png_b64(
-                    [full_mask > 127], image_h, image_w, prompt
-                )
+                raw_instances = prompt_instances[prompt]
+                masks_np = [m for m, _ in raw_instances]
+                scores_list = [s for _, s in raw_instances]
+                instances = _build_instance_list(masks_np, scores_list, image_h, image_w, prompt)
                 result_masks.append({
                     "prompt": prompt,
-                    "mask": mask_b64,
-                    "score": round(prompt_best_score[prompt], 4),
-                    "instance_count": prompt_instance_count[prompt],
+                    "instances": instances,
+                    "instance_count": len(instances),
                 })
 
         # ------------------------------------------------------------------
@@ -756,7 +777,6 @@ async def segment_sam3(request: SegmentSam3Request):
                     batch_prompts.append(prompt)
                     tile_bboxes.append(bbox)
 
-            # Single batched processor call
             inputs = sam3_processor(
                 images=batch_images,
                 text=batch_prompts,
@@ -777,11 +797,7 @@ async def segment_sam3(request: SegmentSam3Request):
                 target_sizes=inputs["original_sizes"].tolist(),
             )
 
-            prompt_full_masks: Dict[str, np.ndarray] = {
-                p: np.zeros((image_h, image_w), dtype=np.uint8) for p in request.prompts
-            }
-            prompt_best_score: Dict[str, float] = {p: 0.0 for p in request.prompts}
-            prompt_instance_count: Dict[str, int] = {p: 0 for p in request.prompts}
+            prompt_instances: Dict[str, list] = {p: [] for p in request.prompts}
 
             for batch_idx, result in enumerate(batch_results):
                 prompt = batch_prompts[batch_idx]
@@ -791,29 +807,22 @@ async def segment_sam3(request: SegmentSam3Request):
 
                 for i, mask_tensor in enumerate(result["masks"]):
                     m = mask_tensor.cpu().numpy().astype(np.uint8) * 255
-                    m_resized = cv2.resize(
-                        m, (tile_w, tile_h), interpolation=cv2.INTER_NEAREST
-                    )
-                    prompt_full_masks[prompt][y0:y1, x0:x1] = np.maximum(
-                        prompt_full_masks[prompt][y0:y1, x0:x1], m_resized
-                    )
-                    if "scores" in result and i < len(result["scores"]):
-                        s = float(result["scores"][i])
-                        if s > prompt_best_score[prompt]:
-                            prompt_best_score[prompt] = s
-                    prompt_instance_count[prompt] += 1
+                    m_resized = cv2.resize(m, (tile_w, tile_h), interpolation=cv2.INTER_NEAREST)
+                    canvas = np.zeros((image_h, image_w), dtype=np.uint8)
+                    canvas[y0:y1, x0:x1] = m_resized
+                    score = float(result["scores"][i]) if "scores" in result and i < len(result["scores"]) else 0.9
+                    prompt_instances[prompt].append((canvas, score))
 
             result_masks = []
             for prompt in request.prompts:
-                full_mask = prompt_full_masks[prompt]
-                mask_b64 = _masks_to_colored_png_b64(
-                    [full_mask > 127], image_h, image_w, prompt
-                )
+                raw_instances = prompt_instances[prompt]
+                masks_np = [m for m, _ in raw_instances]
+                scores_list = [s for _, s in raw_instances]
+                instances = _build_instance_list(masks_np, scores_list, image_h, image_w, prompt)
                 result_masks.append({
                     "prompt": prompt,
-                    "mask": mask_b64,
-                    "score": round(prompt_best_score[prompt], 4),
-                    "instance_count": prompt_instance_count[prompt],
+                    "instances": instances,
+                    "instance_count": len(instances),
                 })
 
         return JSONResponse({"success": True, "masks": result_masks})
