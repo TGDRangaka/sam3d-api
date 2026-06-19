@@ -62,6 +62,14 @@ import uvicorn
 # SAM 2 imports from transformers
 from transformers import Sam2Processor, Sam2Model
 
+# SAM 3 imports from transformers
+try:
+    from transformers import Sam3Processor, Sam3Model
+    SAM3_AVAILABLE = True
+except ImportError:
+    SAM3_AVAILABLE = False
+    print("⚠ Sam3Model/Sam3Processor not available in this transformers version")
+
 # ============================================================================
 # PYTORCH CONFIGURATION FOR SPCONV COMPATIBILITY
 # Set default float dtype to float32 to prevent algorithm tuning errors
@@ -113,12 +121,47 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 # Mount assets folder as static files (accessible at /assets/)
 app.mount("/assets", StaticFiles(directory=ASSETS_DIR), name="assets")
 
-# Global model and processor instances
+# Global model and processor instances (SAM 2)
 model = None
 processor = None
 
+# Global SAM 3 model and processor instances
+sam3_model = None
+sam3_processor = None
+
+# SAM 3 model path — env var allows overriding at deploy time.
+# Set SAM3_MODEL_PATH to a local directory (e.g. /runpod-volume/sam3) or a
+# HuggingFace repo id (e.g. facebook/sam3).  local_files_only is automatically
+# True when the path is a local directory, False when it looks like an HF id.
+SAM3_MODEL_PATH = os.environ.get("SAM3_MODEL_PATH", "facebook/sam3")
+_sam3_local = os.path.isdir(SAM3_MODEL_PATH)
+
 # Task storage for async 3D generation
 generation_tasks: Dict[str, Dict] = {}
+
+
+# ---------------------------------------------------------------------------
+# ImageTiler — ported from sam-3-segment-demo/software_developer/sam_code.py
+# Used by /segment-sam3 to split large images into grid tiles before inference.
+# ---------------------------------------------------------------------------
+import math as _math
+
+class ImageTiler:
+    @staticmethod
+    def create_tiles(image: Image.Image, grid_size: int):
+        """Split image into grid_size x grid_size tiles. Returns list of (tile, (x0,y0,x1,y1))."""
+        width, height = image.size
+        tile_width = _math.ceil(width / grid_size)
+        tile_height = _math.ceil(height / grid_size)
+        tiles = []
+        for row in range(grid_size):
+            for col in range(grid_size):
+                x0 = col * tile_width
+                y0 = row * tile_height
+                x1 = min((col + 1) * tile_width, width)
+                y1 = min((row + 1) * tile_height, height)
+                tiles.append((image.crop((x0, y0, x1, y1)), (x0, y0, x1, y1)))
+        return tiles
 
 
 def initialize_model():
@@ -127,7 +170,7 @@ def initialize_model():
 
     try:
         model_id = "facebook/sam2.1-hiera-large"
-        print(f"Loading model from {model_id}...")
+        print(f"Loading SAM 2 model from {model_id}...")
 
         processor = Sam2Processor.from_pretrained(model_id)
         model = Sam2Model.from_pretrained(model_id).to(device)
@@ -135,14 +178,38 @@ def initialize_model():
         print("✓ SAM 2 model and processor initialized successfully")
 
     except Exception as e:
-        print(f"✗ Error initializing model: {e}")
+        print(f"✗ Error initializing SAM 2 model: {e}")
         raise
+
+
+def initialize_sam3_model():
+    """Initialize SAM 3 model and processor (local directory or HuggingFace)."""
+    global sam3_model, sam3_processor
+
+    if not SAM3_AVAILABLE:
+        print("⚠ Skipping SAM 3 init — Sam3Model not available in transformers")
+        return
+
+    try:
+        print(f"Loading SAM 3 model from '{SAM3_MODEL_PATH}' (local={_sam3_local})...")
+        sam3_processor = Sam3Processor.from_pretrained(
+            SAM3_MODEL_PATH, local_files_only=_sam3_local
+        )
+        sam3_model = Sam3Model.from_pretrained(
+            SAM3_MODEL_PATH, local_files_only=_sam3_local
+        ).to(device)
+        sam3_model.eval()
+        print("✓ SAM 3 model and processor initialized successfully")
+    except Exception as e:
+        # SAM 3 is additive — don't crash the whole server if it fails
+        print(f"⚠ SAM 3 model init failed (SAM 2 still available): {e}")
 
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize models on API startup"""
     initialize_model()
+    initialize_sam3_model()
 
 
 @app.get("/health")
@@ -150,9 +217,16 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "model_loaded": model is not None and processor is not None,
         "device": str(device),
-        "model": "facebook/sam2.1-hiera-large",
+        "sam2": {
+            "loaded": model is not None and processor is not None,
+            "model": "facebook/sam2.1-hiera-large",
+        },
+        "sam3": {
+            "loaded": sam3_model is not None and sam3_processor is not None,
+            "model": SAM3_MODEL_PATH,
+            "available_in_transformers": SAM3_AVAILABLE,
+        },
     }
 
 
@@ -451,6 +525,284 @@ async def segment_image_binary(request: SegmentBinaryRequest):
         traceback.print_exc()
         return JSONResponse(status_code=400, content={"error": str(e)})
 
+
+# ---------------------------------------------------------------------------
+# SAM 3 text-prompt segmentation
+# ---------------------------------------------------------------------------
+
+class SegmentSam3Request(BaseModel):
+    image: str                   # base64 encoded image
+    prompts: List[str]           # text labels e.g. ["house", "tree", "solar panel"]
+    mask_threshold: float = 0.5  # instance-segmentation confidence threshold
+    mode: str = "image_only"     # "image_only" | "sequential_tiles" | "batch_all"
+    tile_grid: int = 4           # grid size used when mode != "image_only"
+
+
+def _sam3_infer_single(image_pil: Image.Image, prompt: str):
+    """
+    Run SAM 3 inference for one image + one text prompt.
+    Returns list of numpy bool masks (H, W) for that prompt.
+    Scores are returned as a parallel list of floats.
+    """
+    inputs = sam3_processor(
+        images=[image_pil],
+        text=[prompt],
+        return_tensors="pt",
+    )
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    with torch.no_grad():
+        outputs = sam3_model(**inputs)
+
+    results = sam3_processor.post_process_instance_segmentation(
+        outputs,
+        threshold=0.5,
+        mask_threshold=0.5,
+        target_sizes=inputs["original_sizes"].tolist(),
+    )
+
+    masks = []
+    scores = []
+    for result in results:
+        for i, mask_tensor in enumerate(result["masks"]):
+            masks.append(mask_tensor.cpu().numpy().astype(bool))
+            score_val = float(result["scores"][i]) if "scores" in result and i < len(result["scores"]) else 0.9
+            scores.append(score_val)
+
+    return masks, scores
+
+
+def _masks_to_union_png_b64(masks, image_h: int, image_w: int) -> str:
+    """Union a list of boolean masks into a single binary PNG, return base64."""
+    union = np.zeros((image_h, image_w), dtype=np.uint8)
+    for m in masks:
+        # Resize mask to image dimensions if needed (tile inference may differ)
+        if m.shape != (image_h, image_w):
+            m_resized = cv2.resize(
+                m.astype(np.uint8) * 255,
+                (image_w, image_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            union = np.maximum(union, m_resized)
+        else:
+            union = np.maximum(union, m.astype(np.uint8) * 255)
+
+    mask_pil = Image.fromarray(union, mode="L")
+    buf = io.BytesIO()
+    mask_pil.save(buf, format="PNG")
+    buf.seek(0)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+@app.post("/segment-sam3")
+async def segment_sam3(request: SegmentSam3Request):
+    """
+    Segment an image using SAM 3 text prompts.
+
+    Accepts an image and a list of text class labels. Returns one binary mask
+    per prompt as a base64-encoded PNG, plus a confidence score.
+
+    Modes
+    -----
+    image_only       — single inference on the full image (fastest, good for
+                       standard photos)
+    sequential_tiles — splits image into tile_grid×tile_grid tiles and runs
+                       inference on each tile separately (lower peak VRAM,
+                       best for large aerial/satellite images)
+    batch_all        — same tiling but batches all tiles+prompts in one call
+                       (fastest for tiled mode but highest VRAM)
+    """
+    if sam3_model is None or sam3_processor is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "SAM 3 model not loaded. Check server logs."},
+        )
+
+    if not request.prompts:
+        return JSONResponse(
+            status_code=400, content={"error": "At least one prompt is required"}
+        )
+
+    valid_modes = {"image_only", "sequential_tiles", "batch_all"}
+    if request.mode not in valid_modes:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"mode must be one of {sorted(valid_modes)}"},
+        )
+
+    try:
+        image_data = base64.b64decode(request.image)
+    except Exception as e:
+        return JSONResponse(
+            status_code=400, content={"error": f"Invalid base64 image: {e}"}
+        )
+
+    try:
+        image_pil = Image.open(io.BytesIO(image_data)).convert("RGB")
+    except Exception as e:
+        return JSONResponse(
+            status_code=400, content={"error": f"Cannot decode image: {e}"}
+        )
+
+    image_w, image_h = image_pil.size  # PIL: (width, height)
+
+    try:
+        # ------------------------------------------------------------------
+        # image_only — one inference call per prompt on the full image
+        # ------------------------------------------------------------------
+        if request.mode == "image_only":
+            result_masks = []
+            for prompt in request.prompts:
+                masks, scores = _sam3_infer_single(image_pil, prompt)
+                best_score = max(scores) if scores else 0.0
+                mask_b64 = _masks_to_union_png_b64(masks, image_h, image_w)
+                result_masks.append({
+                    "prompt": prompt,
+                    "mask": mask_b64,
+                    "score": round(best_score, 4),
+                    "instance_count": len(masks),
+                })
+
+        # ------------------------------------------------------------------
+        # sequential_tiles — tile grid, one prompt×tile at a time
+        # ------------------------------------------------------------------
+        elif request.mode == "sequential_tiles":
+            tiles = ImageTiler.create_tiles(image_pil, request.tile_grid)
+            # Accumulate full-image masks per prompt
+            prompt_full_masks: Dict[str, np.ndarray] = {
+                p: np.zeros((image_h, image_w), dtype=np.uint8) for p in request.prompts
+            }
+            prompt_best_score: Dict[str, float] = {p: 0.0 for p in request.prompts}
+            prompt_instance_count: Dict[str, int] = {p: 0 for p in request.prompts}
+
+            for tile_img, (x0, y0, x1, y1) in tiles:
+                tile_h = y1 - y0
+                tile_w = x1 - x0
+                for prompt in request.prompts:
+                    masks, scores = _sam3_infer_single(tile_img, prompt)
+                    if not masks:
+                        continue
+                    best_score = max(scores)
+                    if best_score > prompt_best_score[prompt]:
+                        prompt_best_score[prompt] = best_score
+                    prompt_instance_count[prompt] += len(masks)
+                    for m in masks:
+                        # Resize tile mask to tile dimensions, then place into full canvas
+                        m_u8 = cv2.resize(
+                            m.astype(np.uint8) * 255,
+                            (tile_w, tile_h),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        prompt_full_masks[prompt][y0:y1, x0:x1] = np.maximum(
+                            prompt_full_masks[prompt][y0:y1, x0:x1], m_u8
+                        )
+
+            result_masks = []
+            for prompt in request.prompts:
+                full_mask = prompt_full_masks[prompt]
+                mask_pil = Image.fromarray(full_mask, mode="L")
+                buf = io.BytesIO()
+                mask_pil.save(buf, format="PNG")
+                buf.seek(0)
+                mask_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                result_masks.append({
+                    "prompt": prompt,
+                    "mask": mask_b64,
+                    "score": round(prompt_best_score[prompt], 4),
+                    "instance_count": prompt_instance_count[prompt],
+                })
+
+        # ------------------------------------------------------------------
+        # batch_all — all tiles × all prompts in one batched inference call
+        # ------------------------------------------------------------------
+        else:  # batch_all
+            tiles = ImageTiler.create_tiles(image_pil, request.tile_grid)
+            batch_images = []
+            batch_prompts = []
+            tile_bboxes = []
+
+            for tile_img, bbox in tiles:
+                for prompt in request.prompts:
+                    batch_images.append(tile_img)
+                    batch_prompts.append(prompt)
+                    tile_bboxes.append(bbox)
+
+            # Single batched processor call
+            inputs = sam3_processor(
+                images=batch_images,
+                text=batch_prompts,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            with torch.no_grad():
+                outputs = sam3_model(**inputs)
+
+            batch_results = sam3_processor.post_process_instance_segmentation(
+                outputs,
+                threshold=0.5,
+                mask_threshold=0.5,
+                target_sizes=inputs["original_sizes"].tolist(),
+            )
+
+            prompt_full_masks: Dict[str, np.ndarray] = {
+                p: np.zeros((image_h, image_w), dtype=np.uint8) for p in request.prompts
+            }
+            prompt_best_score: Dict[str, float] = {p: 0.0 for p in request.prompts}
+            prompt_instance_count: Dict[str, int] = {p: 0 for p in request.prompts}
+
+            for batch_idx, result in enumerate(batch_results):
+                prompt = batch_prompts[batch_idx]
+                x0, y0, x1, y1 = tile_bboxes[batch_idx]
+                tile_h = y1 - y0
+                tile_w = x1 - x0
+
+                for i, mask_tensor in enumerate(result["masks"]):
+                    m = mask_tensor.cpu().numpy().astype(np.uint8) * 255
+                    m_resized = cv2.resize(
+                        m, (tile_w, tile_h), interpolation=cv2.INTER_NEAREST
+                    )
+                    prompt_full_masks[prompt][y0:y1, x0:x1] = np.maximum(
+                        prompt_full_masks[prompt][y0:y1, x0:x1], m_resized
+                    )
+                    if "scores" in result and i < len(result["scores"]):
+                        s = float(result["scores"][i])
+                        if s > prompt_best_score[prompt]:
+                            prompt_best_score[prompt] = s
+                    prompt_instance_count[prompt] += 1
+
+            result_masks = []
+            for prompt in request.prompts:
+                full_mask = prompt_full_masks[prompt]
+                mask_pil = Image.fromarray(full_mask, mode="L")
+                buf = io.BytesIO()
+                mask_pil.save(buf, format="PNG")
+                buf.seek(0)
+                mask_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                result_masks.append({
+                    "prompt": prompt,
+                    "mask": mask_b64,
+                    "score": round(prompt_best_score[prompt], 4),
+                    "instance_count": prompt_instance_count[prompt],
+                })
+
+        return JSONResponse({"success": True, "masks": result_masks})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ---------------------------------------------------------------------------
+# 3D generation
+# ---------------------------------------------------------------------------
 
 class Generate3dRequest(BaseModel):
     image: str  # base64 encoded image
