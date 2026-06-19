@@ -575,11 +575,32 @@ def _sam3_infer_single(image_pil: Image.Image, prompt: str):
     return masks, scores
 
 
-def _masks_to_union_png_b64(masks, image_h: int, image_w: int) -> str:
-    """Union a list of boolean masks into a single binary PNG, return base64."""
+# Per-class overlay colors (RGBA) sent back to the mobile app as pre-composited PNGs.
+# Mobile simply stacks these over the image — no tintColor tricks needed.
+_PROMPT_COLORS: Dict[str, tuple] = {
+    "house":        (255,  60,  60, 160),
+    "tree":         ( 60, 220,  60, 160),
+    "solarpanel":   ( 60, 120, 255, 160),
+    "solar panel":  ( 60, 120, 255, 160),
+    "road":         (255, 200,   0, 160),
+    "car":          (255, 120,   0, 160),
+    "building":     (200,  60, 255, 160),
+    "water":        (  0, 200, 255, 160),
+}
+_DEFAULT_COLOR = (255, 255, 60, 160)
+
+
+def _masks_to_colored_png_b64(masks, image_h: int, image_w: int, prompt: str) -> str:
+    """
+    Union boolean masks and return a pre-colored RGBA PNG (base64).
+
+    Detected pixels → semi-transparent class color.
+    Background pixels → fully transparent.
+    Mobile overlays this directly; no tintColor needed.
+    """
+    # Build grayscale union first
     union = np.zeros((image_h, image_w), dtype=np.uint8)
     for m in masks:
-        # Resize mask to image dimensions if needed (tile inference may differ)
         if m.shape != (image_h, image_w):
             m_resized = cv2.resize(
                 m.astype(np.uint8) * 255,
@@ -590,9 +611,16 @@ def _masks_to_union_png_b64(masks, image_h: int, image_w: int) -> str:
         else:
             union = np.maximum(union, m.astype(np.uint8) * 255)
 
-    mask_pil = Image.fromarray(union, mode="L")
+    r, g, b, a = _PROMPT_COLORS.get(prompt.lower(), _DEFAULT_COLOR)
+
+    # RGBA canvas: detected pixels get (r,g,b,a), rest stays (0,0,0,0)
+    rgba = np.zeros((image_h, image_w, 4), dtype=np.uint8)
+    detected = union > 127
+    rgba[detected] = [r, g, b, a]
+
+    overlay_pil = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
-    mask_pil.save(buf, format="PNG")
+    overlay_pil.save(buf, format="PNG")
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
@@ -658,7 +686,7 @@ async def segment_sam3(request: SegmentSam3Request):
             for prompt in request.prompts:
                 masks, scores = _sam3_infer_single(image_pil, prompt)
                 best_score = max(scores) if scores else 0.0
-                mask_b64 = _masks_to_union_png_b64(masks, image_h, image_w)
+                mask_b64 = _masks_to_colored_png_b64(masks, image_h, image_w, prompt)
                 result_masks.append({
                     "prompt": prompt,
                     "mask": mask_b64,
@@ -703,11 +731,9 @@ async def segment_sam3(request: SegmentSam3Request):
             result_masks = []
             for prompt in request.prompts:
                 full_mask = prompt_full_masks[prompt]
-                mask_pil = Image.fromarray(full_mask, mode="L")
-                buf = io.BytesIO()
-                mask_pil.save(buf, format="PNG")
-                buf.seek(0)
-                mask_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                mask_b64 = _masks_to_colored_png_b64(
+                    [full_mask > 127], image_h, image_w, prompt
+                )
                 result_masks.append({
                     "prompt": prompt,
                     "mask": mask_b64,
@@ -780,11 +806,9 @@ async def segment_sam3(request: SegmentSam3Request):
             result_masks = []
             for prompt in request.prompts:
                 full_mask = prompt_full_masks[prompt]
-                mask_pil = Image.fromarray(full_mask, mode="L")
-                buf = io.BytesIO()
-                mask_pil.save(buf, format="PNG")
-                buf.seek(0)
-                mask_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                mask_b64 = _masks_to_colored_png_b64(
+                    [full_mask > 127], image_h, image_w, prompt
+                )
                 result_masks.append({
                     "prompt": prompt,
                     "mask": mask_b64,
