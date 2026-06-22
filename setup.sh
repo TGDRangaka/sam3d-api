@@ -92,8 +92,21 @@ if [ -f "requirements.txt" ]; then
 
     pip install -r requirements.txt
     pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
+
+    # ── Fix: upgrade transformers to 5.x for Sam3Model support ──
+    echo "Upgrading transformers for SAM 3 support..."
+    pip install "transformers>=5.0.0" -q
 else
     echo "No requirements.txt found in $(pwd)."
+fi
+
+# ── Fix: save HF_TOKEN permanently in conda env ─────────────────
+echo "--- 8. Setting HF_TOKEN ---"
+if [ -n "$HF_TOKEN" ]; then
+    conda env config vars set HF_TOKEN="$HF_TOKEN" -n sam3d-objects
+    echo "✅ HF_TOKEN saved to conda environment"
+else
+    echo "⚠ HF_TOKEN not set. Export it before running: export HF_TOKEN=hf_..."
 fi
 
 echo "--- Setup Complete! ---"
