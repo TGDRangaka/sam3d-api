@@ -1,6 +1,7 @@
 cat > /workspace/start.sh << 'EOF'
 #!/bin/bash
-source ~/miniconda3/etc/profile.d/conda.sh
+# Conda lives on the persistent volume (see setup.sh) so this survives restarts.
+source /workspace/miniconda3/etc/profile.d/conda.sh
 conda activate sam3d-objects
 cd /workspace/sam3d-api
 git pull

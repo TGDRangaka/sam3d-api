@@ -25,7 +25,10 @@ else
 fi
 
 echo "--- 2. Checking Miniconda ---"
-CONDA_ROOT="$HOME/miniconda3"
+# CONDA_ROOT="$HOME/miniconda3"
+# Install Miniconda on the persistent volume so it survives pod restarts.
+# (Previously $HOME/miniconda3, which lives on the ephemeral container FS.)
+CONDA_ROOT="/workspace/miniconda3"
 if [ -d "$CONDA_ROOT" ]; then
     echo "Miniconda already installed at $CONDA_ROOT."
 else
